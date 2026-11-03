@@ -1,0 +1,47 @@
+name: Tareas programadas
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Enviar mensaje de prueba"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tareas
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restaurar datos
+        uses: actions/cache/restore@v4
+        with:
+          path: .data
+          key: d-${{ github.run_id }}
+          restore-keys: d-
+
+      - name: Ejecutar
+        id: run
+        env:
+          CONFIG: ${{ secrets.CONFIG }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TEST_MESSAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.test && '1' || '0' }}
+        run: python3 main.py
+
+      - name: Guardar datos
+        if: always() && steps.run.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .data
+          key: d-${{ github.run_id }}-${{ github.run_attempt }}
