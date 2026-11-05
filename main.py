@@ -28,6 +28,7 @@ ONLY_STORE_URL = os.environ.get("STORE_URL", "")
 CHAT_IDS = []
 BASELINE = False  # True si no hay estado guardado (evita repetir avisos ya enviados)
 FAIL_ALERT_AFTER = 3  # avisos técnicos tras N fallos seguidos de una fuente
+DOWN_ALERT_AFTER = int(os.environ.get("DOWN_ALERT_AFTER", "3"))  # caída: N revisiones seguidas (~N minutos)
 ALERT_REPEAT = int(os.environ.get("ALERT_REPEAT", "3"))   # repeticiones de la alerta de disponible
 ALERT_GAP_SECONDS = int(os.environ.get("ALERT_GAP_SECONDS", "60"))  # espera entre repeticiones
 HEARTBEAT_HOUR_UTC = 13  # 8:00 a. m. en Colombia
@@ -68,6 +69,28 @@ def http_get_json(url, retries=2):
             if attempt < retries:
                 time.sleep(2 * (attempt + 1))
     raise RuntimeError(f"{url} -> {last_err}")
+
+
+def page_status(url):
+    """Devuelve None si la página principal responde; si no, una descripción corta del problema.
+    Solo cuenta como caída: error 5xx, sin conexión o sin respuesta (403/429 = bloqueo, no caída)."""
+    problem = None
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(url, headers={**HEADERS, "Accept": "text/html"})
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                resp.read(2048)
+            return None
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                return None
+            problem = f"error {e.code}"
+        except Exception as e:  # noqa: BLE001
+            text = str(e).lower()
+            problem = "no responde" if "timed out" in text or "timeout" in text else "sin conexión"
+        if attempt == 0:
+            time.sleep(5)
+    return problem
 
 
 def to_number(value):
@@ -339,6 +362,27 @@ def check_store(store, state):
     key, name = store["key"], store["name"]
     fails = state.setdefault("fails", {})
     known = state.setdefault("products", {})
+    down = state.setdefault("down", {})  # {fuente: {"n": fallos seguidos, "since": epoch}}
+
+    # ¿La página principal está caída?
+    problem = page_status((ONLY_STORE_URL or store["url"]).rstrip("/") + "/")
+    d = down.get(key) or {"n": 0, "since": None}
+    if problem:
+        d["n"] += 1
+        d["since"] = d["since"] or time.time()
+        down[key] = d
+        mins = max(1, round((time.time() - d["since"]) / 60))
+        if d["n"] == DOWN_ALERT_AFTER:
+            send_telegram(T.get("down", "🔴 La página de {name} parece estar caída: lleva unos {mins} min "
+                                "sin funcionar ({detail}). Te aviso cuando vuelva.")
+                          .format(name=name, mins=mins, detail=problem))
+        return T.get("sum_down", "• {name}: 🔴 página caída ({detail})").format(name=name, detail=problem)
+    if d["n"] >= DOWN_ALERT_AFTER:
+        mins = max(1, round((time.time() - d["since"]) / 60))
+        send_telegram(T.get("up", "🟢 La página de {name} volvió a funcionar (estuvo caída unos {mins} min).")
+                      .format(name=name, mins=mins))
+    down[key] = {"n": 0, "since": None}
+
     try:
         current = find_products(store)
     except Exception as e:  # noqa: BLE001
