@@ -178,11 +178,15 @@ def shopify_info(base, p):
     return str(p.get("id") or p.get("handle")), info
 
 
+ALL_PRODUCTS = {}  # base -> {id: info} del catálogo completo (solo si se leyó entero)
+
+
 def find_shopify(base):
     found, errors, ok = {}, [], 0
+    allp, complete = {}, False
     # 1) Catálogo completo
     try:
-        for page in range(1, 21):
+        for page in range(1, 41):
             data = http_get_json(f"{base}/products.json?limit=250&page={page}")
             products = data.get("products")
             if not isinstance(products, list):
@@ -190,12 +194,16 @@ def find_shopify(base):
             ok += 1
             for p in products:
                 pid, info = shopify_info(base, p)
+                allp[pid] = info
                 if matches(info["name"]):
                     found[pid] = info
             if len(products) < 250:
+                complete = True
                 break
     except Exception as e:  # noqa: BLE001
         errors.append(str(e))
+    if complete:
+        ALL_PRODUCTS[base] = allp
     # 2) Buscador (respaldo)
     for term in KEYWORDS:
         q = urllib.parse.quote(term)
@@ -357,6 +365,71 @@ def setup_chats(state):
 
 # ---------- Principal ----------
 
+def fmt_item(info):
+    status = T.get("st_yes", "DISPONIBLE") if info["available"] else T.get("st_no", "sin stock")
+    return f"• {info['name']} — {fmt_price(info['price'])} — {status}\n{info['url']}"
+
+
+def send_batch(title, items, urgent_alert):
+    """Envía una lista de productos; si es larga la parte en varios mensajes."""
+    chunks, cur = [], []
+    for it in items:
+        if sum(len(x) for x in cur) + len(it) > 3200:
+            chunks.append(cur)
+            cur = []
+        cur.append(it)
+    if cur:
+        chunks.append(cur)
+    for i, chunk in enumerate(chunks):
+        head = title if len(chunks) == 1 else f"{title} [{i + 1}/{len(chunks)}]"
+        body = "\n\n".join(chunk)
+        if urgent_alert and i == 0:
+            urgent(head, body)
+        else:
+            send_telegram(f"{head}\n\n{body}")
+
+
+def check_new_products(store, state, current):
+    """Avisa de cualquier producto nuevo en el catálogo (no solo los que coinciden con las palabras)."""
+    key, name = store["key"], store["name"]
+    base = (ONLY_STORE_URL or store["url"]).rstrip("/")
+    allp = ALL_PRODUCTS.get(base)
+    if allp is None:  # catálogo incompleto en esta revisión: no se compara
+        return
+    seen_all = state.setdefault("seen", {})
+    tracked = state.setdefault("new_tracked", {}).setdefault(key, {})
+    if key not in seen_all:  # primera vez: guardar el catálogo actual sin avisar
+        seen_all[key] = sorted(allp)
+        return
+    seen = set(seen_all[key])
+    new_ids = [pid for pid in allp if pid not in seen and pid not in current]
+    if new_ids:
+        items = [fmt_item(allp[pid]) for pid in new_ids]
+        any_avail = any(allp[pid]["available"] for pid in new_ids)
+        n = len(new_ids)
+        if any_avail:
+            title = T.get("new_avail", "🚨🆕 ¡{NAME} PUBLICÓ {n} PRODUCTO(S) NUEVO(S) Y YA SE PUEDEN COMPRAR!")
+        else:
+            title = T.get("new", "🆕 {name} publicó {n} producto(s) nuevo(s) (todavía sin stock). "
+                                 "Te aviso cuando se puedan comprar:")
+        send_batch(title.format(name=name, NAME=name.upper(), n=n), items, any_avail)
+        for pid in new_ids:
+            tracked[pid] = {"name": allp[pid]["name"], "available": allp[pid]["available"]}
+    added = set(allp) - seen
+    if added:
+        seen_all[key] = sorted(seen | added)
+    # productos nuevos que antes no tenían stock y ahora sí
+    now_avail = [pid for pid, t in tracked.items()
+                 if pid in allp and allp[pid]["available"] and not t.get("available") and pid not in new_ids]
+    if now_avail:
+        title = T.get("new_now_avail", "🚨🛒 ¡YA SE PUEDEN COMPRAR {n} PRODUCTO(S) NUEVO(S) EN {NAME}!")
+        send_batch(title.format(name=name, NAME=name.upper(), n=len(now_avail)),
+                   [fmt_item(allp[pid]) for pid in now_avail], True)
+    for pid, t in tracked.items():
+        if pid in allp:
+            t["available"] = allp[pid]["available"]
+
+
 def check_store(store, state):
     """Revisa una fuente, envía avisos y devuelve una línea de resumen."""
     key, name = store["key"], store["name"]
@@ -441,11 +514,20 @@ def check_store(store, state):
             entry["fp"] = info.get("fp") or before.get("fp")
         known[skey] = entry
 
-    if not current:
+    extra = []
+    if store.get("watch_all_new"):
+        check_new_products(store, state, current)
+        for t in state.get("new_tracked", {}).get(key, {}).values():
+            status = T.get("st_yes", "DISPONIBLE") if t.get("available") else T.get("st_no", "sin stock")
+            extra.append(T["sum_item"].format(name=name, item=t["name"], status=status))
+
+    if not current and not extra:
         return T["sum_none"].format(name=name)
-    return "\n".join(T["sum_item"].format(name=name, item=i["name"],
+    if not current:
+        return "\n".join(extra)
+    return "\n".join(extra + [T["sum_item"].format(name=name, item=i["name"],
                                           status=T["st_yes"] if i["available"] else T["st_no"])
-                     for i in current.values())
+                     for i in current.values()])
 
 
 def main():
